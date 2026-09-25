@@ -1,0 +1,36 @@
+# Runtime data and logs — never commit these, they contain your reminders.
+reminders.json
+reminders.json.tmp
+reminders.json.corrupt.*
+telegram_reminders.json
+telegram_reminders.json.tmp
+telegram_reminders.json.corrupt.*
+missed_notifications.log
+missed_notifications.log.*
+logs/
+
+# Credentials
+token.txt
+conf.env
+conf.env.bak
+conf.env.tmp
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editors and OS clutter
+.DS_Store
+.idea/
+.vscode/
+
+# Internal pre-open-source audit notes — not for publication
+tests/FINDINGS.md
+tests/LOG.md
+tests/VERIFY.md

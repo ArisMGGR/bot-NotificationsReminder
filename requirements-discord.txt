@@ -1,0 +1,5 @@
+# Libraries for running the bot on Discord. setup_wizard.py installs this
+# file (and/or requirements-telegram.txt) into ./venv for the platforms you
+# choose. 2.6 is the first release with the form labels /new uses.
+discord.py>=2.6,<3.0
+python-dotenv>=1.0.0,<2.0.0

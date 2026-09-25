@@ -1,0 +1,6 @@
+# Everything, for both platforms. Requires Python 3.10 or newer; the bot
+# checks this at startup. To install only what one platform needs, use
+# requirements-telegram.txt or requirements-discord.txt (setup_wizard.py
+# does this for you).
+-r requirements-telegram.txt
+-r requirements-discord.txt

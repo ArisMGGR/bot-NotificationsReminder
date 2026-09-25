@@ -1,0 +1,51 @@
+[Unit]
+Description=Reminder Bot (Telegram/Discord)
+# Wait for the network so the bot can reach Telegram/Discord on boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# __USER__, __WORKDIR__ and __PYTHON__ are filled in by install-service.sh.
+# If you edit this file by hand, replace them with real values, e.g.:
+#   User=youruser
+#   WorkingDirectory=/home/youruser/server_NotificationBot
+#   ExecStart="/home/youruser/server_NotificationBot/venv/bin/python" reminder_bot.py
+# Keep the double quotes on ExecStart= and ReadWritePaths=: systemd splits
+# those at spaces, so an unquoted path with a space in it would break the unit.
+User=__USER__
+WorkingDirectory=__WORKDIR__
+ExecStart="__PYTHON__" reminder_bot.py
+
+# Load the token (and any other settings) from the conf.env file.
+EnvironmentFile=__WORKDIR__/conf.env
+
+# Restart automatically if it ever crashes, with a short back-off.
+Restart=on-failure
+RestartSec=5
+
+# Send stdout/stderr to the systemd journal (view with: journalctl -u reminder-bot).
+StandardOutput=journal
+StandardError=journal
+
+# --- Sandboxing -------------------------------------------------------------
+# The bot only ever needs to read its own directory and write its data file and
+# logs there, so everything else is made read-only or taken away. If you move
+# the data/log files outside the project folder, add their directory to
+# ReadWritePaths as well or the bot won't be able to write them.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths="__WORKDIR__"
+# New log and data files are readable only by the user the bot runs as.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

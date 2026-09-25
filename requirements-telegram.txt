@@ -1,0 +1,6 @@
+# Libraries for running the bot on Telegram. setup_wizard.py installs this
+# file (and/or requirements-discord.txt) into ./venv for the platforms you
+# choose. Upper bounds are pinned so a future major release can't silently
+# break an install — raise them deliberately after testing.
+python-telegram-bot>=20.0,<23.0
+python-dotenv>=1.0.0,<2.0.0
