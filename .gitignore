@@ -22,15 +22,11 @@ __pycache__/
 *.pyo
 .venv/
 venv/
-*.egg-info/
 .pytest_cache/
 
 # Editors and OS clutter
 .DS_Store
+Thumbs.db
+desktop.ini
 .idea/
 .vscode/
-
-# Internal pre-open-source audit notes — not for publication
-tests/FINDINGS.md
-tests/LOG.md
-tests/VERIFY.md
