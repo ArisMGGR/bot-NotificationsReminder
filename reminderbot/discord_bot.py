@@ -122,7 +122,7 @@ def clip(text, limit=MAX_OPTION_LEN):
 
 
 def alert_text(reminder):
-    return f"🔔 **{esc(reminder['title'])}**\n\nYou have to check it!"
+    return f"🔔 **{esc(reminder['title'])}**\nYou have to check it!"
 
 
 def alert_view(reminder_id):
