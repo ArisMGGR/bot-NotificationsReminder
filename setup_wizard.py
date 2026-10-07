@@ -48,7 +48,7 @@ PLATFORM_LABELS = {"telegram": "Telegram", "discord": "Discord"}
 DISCORD_PERMISSIONS = 1024 | 2048 | 274877906944 | 65536
 
 # Discord asks API clients to identify themselves like this.
-PROJECT_URL = "https://github.com/ArisMGGR/server_NotificationBot"
+PROJECT_URL = "https://github.com/ArisMGGR/bot-NotificationsReminder"
 DISCORD_USER_AGENT = f"DiscordBot ({PROJECT_URL}, 1.0) reminder-bot-setup"
 
 # The settings this wizard manages, in the order they are written.

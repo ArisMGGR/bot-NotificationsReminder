@@ -9,8 +9,8 @@ Type=simple
 # __USER__, __WORKDIR__ and __PYTHON__ are filled in by install-service.sh.
 # If you edit this file by hand, replace them with real values, e.g.:
 #   User=youruser
-#   WorkingDirectory=/home/youruser/server_NotificationBot
-#   ExecStart="/home/youruser/server_NotificationBot/venv/bin/python" reminder_bot.py
+#   WorkingDirectory=/home/youruser/bot-NotificationsReminder
+#   ExecStart="/home/youruser/bot-NotificationsReminder/venv/bin/python" reminder_bot.py
 # Keep the double quotes on ExecStart= and ReadWritePaths=: systemd splits
 # those at spaces, so an unquoted path with a space in it would break the unit.
 User=__USER__

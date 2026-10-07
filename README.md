@@ -9,7 +9,7 @@ Notifications arrive through **Telegram**, **Discord**, or both — on your phon
 and desktop alike. The bot can run anywhere (your PC, a Raspberry Pi, a server) —
 you don't need to keep any window open.
 
-> One project, a few names you'll see: the repository is `server_NotificationBot`,
+> One project, a few names you'll see: the repository is `bot-NotificationsReminder`,
 > the script is `reminder_bot.py`, and the systemd unit is `reminder-bot`. They
 > all refer to this bot.
 
