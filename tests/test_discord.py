@@ -6,6 +6,8 @@ buttons and the allow-lists can be checked without a token or a network.
 """
 
 import asyncio
+import logging
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -446,3 +448,35 @@ def test_alerts_are_held_for_channels_outside_the_allow_lists(monkeypatch, acces
 
 def test_describe_error_is_registered_with_the_core():
     assert "Discord" in core.describe_error(http_error(discord.Forbidden, 403))
+
+
+def log_from_discord_client(error, message, *args):
+    logger = logging.getLogger("discord.client")
+    try:
+        raise error
+    except Exception:
+        logger.exception(message, *args)
+
+
+def test_reconnect_traceback_becomes_one_readable_warning(caplog):
+    import aiohttp
+
+    dns_failure = aiohttp.ClientConnectorError(
+        SimpleNamespace(host="gateway.discord.gg", port=443, ssl=True),
+        socket.gaierror(-3, "Temporary failure in name resolution"),
+    )
+    with caplog.at_level(logging.WARNING, logger="discord.client"):
+        log_from_discord_client(dns_failure, "Attempting a reconnect in %.2fs", 3.16)
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is None
+    assert "DNS lookup for gateway.discord.gg failed" in record.getMessage()
+    assert "next attempt in 3.16s" in record.getMessage()
+
+
+def test_reconnect_filter_leaves_other_discord_errors_alone(caplog):
+    with caplog.at_level(logging.WARNING, logger="discord.client"):
+        log_from_discord_client(ValueError("boom"), "Ignoring exception in on_ready")
+    [record] = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None

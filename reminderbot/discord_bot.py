@@ -19,7 +19,9 @@ needed to handle them, so they keep working after the bot restarts.
 """
 
 import asyncio
+import logging
 import os
+import socket
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -472,6 +474,14 @@ def describe_error(error: Exception) -> str:
         )
     if isinstance(error, discord.HTTPException):
         return f"⚠️  Discord rejected a request we sent ({error.status}: {error.text})."
+    if isinstance(error, aiohttp.ClientConnectorError) and isinstance(
+        error.os_error, socket.gaierror
+    ):
+        return (
+            f"🌐 Can't reach Discord: the DNS lookup for {error.host} failed, so "
+            "this machine is offline or its network/DNS isn't working right now - "
+            "the bot reconnects automatically once it's back"
+        )
     if isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError)):
         detail = str(error).strip() or error.__class__.__name__
         return (
@@ -482,6 +492,31 @@ def describe_error(error: Exception) -> str:
 
 
 core.ERROR_DESCRIBERS.append(describe_error)
+
+
+class ReconnectLogFilter(logging.Filter):
+    """Turn discord.py's per-retry traceback dump into one readable warning."""
+
+    PREFIX = "Attempting a reconnect in "
+
+    def filter(self, record):
+        error = record.exc_info[1] if record.exc_info else None
+        message = record.getMessage()
+        if error is None or not message.startswith(self.PREFIX):
+            return True
+        reason = describe_error(error) or (
+            f"🌐 Lost the connection to Discord ({error.__class__.__name__}: {error})"
+        )
+        delay = message.removeprefix(self.PREFIX)
+        record.msg = f"{reason.rstrip('.')} (next attempt in {delay})."
+        record.args = None
+        record.exc_info = None
+        record.exc_text = None
+        record.levelno, record.levelname = logging.WARNING, "WARNING"
+        return True
+
+
+logging.getLogger("discord.client").addFilter(ReconnectLogFilter())
 
 
 async def report_interaction_error(interaction, error):
