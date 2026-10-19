@@ -24,6 +24,9 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Audit notes, not for publication
+tests/FINDINGS.md
+
 # Editors and OS clutter
 .DS_Store
 Thumbs.db

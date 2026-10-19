@@ -39,11 +39,30 @@ LEGACY_SERVICE_NAME="telegram-reminder-bot"
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORKDIR"
 
+# Pick a Python interpreter: prefer the virtualenv setup_wizard.py creates,
+# then an older .venv, else system python3. Picked first so the "start it by
+# hand" hint below names an interpreter that exists.
+if [[ -x "$WORKDIR/venv/bin/python" ]]; then
+    PYTHON="$WORKDIR/venv/bin/python"
+elif [[ -x "$WORKDIR/.venv/bin/python" ]]; then
+    PYTHON="$WORKDIR/.venv/bin/python"
+else
+    # "|| true": under set -e a failed lookup would end the script here
+    # without a word; say why instead.
+    PYTHON="$(command -v python3 || true)"
+    if [[ -z "$PYTHON" ]]; then
+        echo "Error: no ./venv and no python3 on the PATH, so there is no Python to run the bot with." >&2
+        echo "Install Python 3.10 or newer, then run python3 setup_wizard.py to create ./venv." >&2
+        exit 1
+    fi
+fi
+
 # Checked before anything is changed, so a machine that can't take the
 # service stops here with a reason rather than halfway through the install.
 if ! command -v systemctl >/dev/null 2>&1; then
     echo "Error: systemctl not found, so the bot can't be installed as a systemd service." >&2
-    echo "Start it by hand instead:  venv/bin/python reminder_bot.py" >&2
+    # Relative to the project folder for a venv; %q quotes a path with spaces.
+    printf 'Start it by hand instead:  %q reminder_bot.py\n' "${PYTHON#"$WORKDIR"/}" >&2
     exit 1
 fi
 
@@ -59,24 +78,27 @@ else
     exit 1
 fi
 
-# The user the bot should run as (the person invoking the script, not root).
-RUN_USER="${SUDO_USER:-$(id -un)}"
-
-# Pick a Python interpreter: prefer the virtualenv setup_wizard.py creates,
-# then an older .venv, else system python3.
-if [[ -x "$WORKDIR/venv/bin/python" ]]; then
-    PYTHON="$WORKDIR/venv/bin/python"
-elif [[ -x "$WORKDIR/.venv/bin/python" ]]; then
-    PYTHON="$WORKDIR/.venv/bin/python"
-else
-    # "|| true": under set -e a failed lookup would end the script here
-    # without a word; say why instead.
-    PYTHON="$(command -v python3 || true)"
-    if [[ -z "$PYTHON" ]]; then
-        echo "Error: no ./venv and no python3 on the PATH, so there is no Python to run the bot with." >&2
-        echo "Install Python 3.10 or newer, then run python3 setup_wizard.py to create ./venv." >&2
-        exit 1
+# The user the bot should run as: the person the project belongs to, not root.
+# Under sudo that is SUDO_USER. A plain root shell (what the check above tells
+# a machine without sudo to use) has no SUDO_USER, and id -un would give
+# "root"; take the project folder's owner instead, so the bot's data files
+# stay readable by that person.
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    RUN_USER="$SUDO_USER"
+elif [[ "$(id -u)" -eq 0 ]]; then
+    RUN_USER="$(stat -c '%U' "$WORKDIR" 2>/dev/null || echo root)"
+    # An owner with no name in /etc/passwd shows as UNKNOWN; systemd's User=
+    # takes the numeric id as well.
+    if [[ "$RUN_USER" == "UNKNOWN" ]]; then
+        RUN_USER="$(stat -c '%u' "$WORKDIR")"
     fi
+else
+    RUN_USER="$(id -un)"
+fi
+if [[ "$RUN_USER" == "root" ]]; then
+    echo "Note: $WORKDIR belongs to root, so the bot will run as root." >&2
+    echo "To run it as someone else, give them the folder first:  chown -R USER: \"$WORKDIR\"" >&2
+    echo >&2
 fi
 
 echo "Project directory : $WORKDIR"
@@ -127,9 +149,17 @@ for platform in $PLATFORMS; do
     esac
     if ! "$PYTHON" -c "import $module" >/dev/null 2>&1; then
         echo "Warning: the $platform library doesn't seem installed for $PYTHON." >&2
-        echo "Install it first, e.g.:" >&2
-        echo "    $PYTHON -m pip install -r requirements-$platform.txt" >&2
-        echo "(or run python3 setup_wizard.py and let it create ./venv)" >&2
+        if [[ "$PYTHON" == "$WORKDIR/venv/bin/python" || "$PYTHON" == "$WORKDIR/.venv/bin/python" ]]; then
+            echo "Install it first, e.g.:" >&2
+            # %q quotes the path, so the line still works when pasted if it has spaces.
+            printf '    %q -m pip install -r requirements-%s.txt\n' "$PYTHON" "$platform" >&2
+            echo "(or run python3 setup_wizard.py and let it create ./venv)" >&2
+        else
+            # The system Python: Debian 12, Ubuntu 23.04 and newer refuse pip
+            # installs into it ("externally-managed-environment").
+            echo "Install it into a ./venv first: run python3 setup_wizard.py and let it" >&2
+            echo "create one, then run this script again (it uses ./venv when it exists)." >&2
+        fi
         echo
     fi
 done

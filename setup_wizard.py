@@ -34,7 +34,10 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from reminderbot.config import CONF_FILE, PLATFORMS, TOKEN_FILE, read_conf_file  # noqa: E402
+from reminderbot.config import (  # noqa: E402
+    CONF_FILE, PLATFORMS, TOKEN_FILE, ConfFileError, TokenFileError, read_conf_file,
+    read_token_file,
+)
 
 BACKUP_FILE = CONF_FILE + ".bak"
 VENV_DIR = os.path.join(HERE, "venv")
@@ -113,7 +116,9 @@ def ask_choice(question, choices, default):
         answer = ask(prompt).lower()
         if not answer and default in keys:
             return default
-        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+        # isdecimal(), not isdigit(): a superscript like "²" is a digit that
+        # int() rejects, and the ValueError would end the wizard.
+        if answer.isdecimal() and 1 <= int(answer) <= len(choices):
             return keys[int(answer) - 1]
         if answer in keys:
             return answer
@@ -138,6 +143,14 @@ def mask(token):
     if len(token) <= 12:
         return "*" * len(token)
     return f"{token[:4]}…{token[-4:]}"
+
+
+# Every character a token can hold. The online checks put the token in a URL
+# or a header, where anything else breaks the request before it is sent: a
+# space ended the wizard in an InvalidURL traceback, and a pasted "…" read as
+# "couldn't reach Telegram", whose next question defaults to keeping it.
+TELEGRAM_TOKEN_CHARS = re.compile(r"[0-9A-Za-z_:-]+")
+DISCORD_TOKEN_CHARS = re.compile(r"[0-9A-Za-z_.-]+")
 
 
 def looks_like_telegram_token(token):
@@ -175,14 +188,22 @@ def format_ids(ids):
 
 
 def default_platforms(existing):
-    """The platform choice to offer as the default, from an existing conf.env."""
-    raw = existing.get("BOT_PLATFORMS", "").lower().replace(",", " ").split()
-    chosen = [p for p in PLATFORMS if p in raw]
-    if not chosen:
-        if existing.get("TELEGRAM_BOT_TOKEN") or os.path.exists(TOKEN_FILE):
-            chosen.append("telegram")
-        if existing.get("DISCORD_BOT_TOKEN"):
-            chosen.append("discord")
+    """The platform choice to offer as the default, from an existing conf.env.
+
+    Follows config.enabled_platforms(): once BOT_PLATFORMS is set, only the
+    platforms it names count. Falling back to the tokens for a BOT_PLATFORMS
+    that names none ("telgram") offered Telegram as the current setting while
+    the bot itself started nothing.
+    """
+    raw = existing.get("BOT_PLATFORMS", "").strip().lower()
+    if raw:
+        named = raw.replace(",", " ").split()
+        return ",".join(p for p in PLATFORMS if p in named)
+    chosen = []
+    if existing.get("TELEGRAM_BOT_TOKEN") or os.path.exists(TOKEN_FILE):
+        chosen.append("telegram")
+    if existing.get("DISCORD_BOT_TOKEN"):
+        chosen.append("discord")
     return ",".join(chosen)
 
 
@@ -213,6 +234,8 @@ def check_telegram_token(token):
     Returns (True, "@botname"), (False, reason) if Telegram rejected it, or
     (None, reason) if Telegram couldn't be reached to check.
     """
+    if not TELEGRAM_TOKEN_CHARS.fullmatch(token):
+        return False, "That token holds a character no Telegram token has (a space, or a pasted “…”)"
     try:
         data = http_get_json(f"https://api.telegram.org/bot{token}/getMe")
     except urllib.error.HTTPError as e:
@@ -232,6 +255,8 @@ def check_discord_token(token):
     Returns (True, (bot name, application id)), (False, reason) if Discord
     rejected it, or (None, reason) if Discord couldn't be reached to check.
     """
+    if not DISCORD_TOKEN_CHARS.fullmatch(token):
+        return False, "That token holds a character no Discord token has (a space, or a pasted “…”)"
     headers = {"Authorization": f"Bot {token}", "User-Agent": DISCORD_USER_AGENT}
     try:
         user = http_get_json("https://discord.com/api/v10/users/@me", headers)
@@ -263,6 +288,11 @@ def discord_invite_url(app_id):
 
 def choose_platforms(existing):
     heading("Platforms")
+    current = default_platforms(existing)
+    raw = existing.get("BOT_PLATFORMS", "").strip()
+    if raw and not current:
+        # The default offered below is then only a suggestion, not what runs.
+        print(f"BOT_PLATFORMS={raw} in conf.env names no platform, so the bot starts none.")
     choice = ask_choice(
         "Where should the bot run?",
         [
@@ -270,7 +300,7 @@ def choose_platforms(existing):
             ("discord", "Discord only"),
             ("telegram,discord", "Both Telegram and Discord (each keeps its own reminders)"),
         ],
-        default_platforms(existing) or "telegram",
+        current or "telegram",
     )
     return choice.split(",")
 
@@ -328,9 +358,11 @@ def configure_telegram(existing, settings):
     heading("Telegram")
     print("Get a token from @BotFather in Telegram: send /newbot and follow the prompts.")
     current = current_value(existing, "TELEGRAM_BOT_TOKEN")
-    if not current and os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            current = f.read().strip()
+    if not current:
+        try:
+            current = read_token_file(TOKEN_FILE)
+        except TokenFileError as e:
+            print(f"  ! {e}")
     token, info = ask_token(
         "telegram", current, looks_like_telegram_token, check_telegram_token,
         "123456789:ABC-DEF…",
@@ -556,14 +588,36 @@ def setup_venv(platforms):
         if action == "skip":
             return python
         if action == "recreate":
-            shutil.rmtree(VENV_DIR)
+            try:
+                shutil.rmtree(VENV_DIR)
+            except OSError as e:
+                # Windows won't delete files a running bot holds open, so
+                # rmtree stops partway with a traceback that ended the wizard.
+                print(f"  ✗ Couldn't delete {VENV_DIR} ({e.strerror or e}).")
+                print("  If the bot is running from it, stop the bot, then run the wizard")
+                print("  again and choose to recreate it: ./venv may be incomplete until then.")
+                return None
             if not create_venv():
                 return None
     else:
         if not ask_yes_no("Create a virtual environment in ./venv and install the libraries?"):
+            # Debian 12, Ubuntu 23.04 and newer mark the system Python as
+            # "externally managed", and pip refuses to install into it, so the
+            # manual commands build ./venv and install there, as README does.
+            # The venv is made with the Python running this wizard: "python3"
+            # may be too old, or on Windows only the Microsoft Store stub.
             files = " ".join(f"-r requirements-{p}.txt" for p in platforms)
-            print("  Skipped. Install the libraries yourself before starting the bot:")
-            print(f"    python3 -m pip install {files}")
+            maker = shell_quote(sys.executable)
+            if os.name == "nt" and maker != sys.executable:
+                # Windows PowerShell 5.1 rejects "C:\My Py\python.exe" -m venv.
+                maker = f"& {maker}"
+            venv_dir = shell_quote(os.path.relpath(VENV_DIR, HERE))
+            shown = shell_quote(os.path.relpath(python, HERE))
+            print("  Skipped. The bot needs these libraries before it can start. The easy")
+            print("  way is to run this wizard again and let it create ./venv. Or create it")
+            print("  yourself, from this folder:")
+            print(f"    {maker} -m venv {venv_dir}")
+            print(f"    {shown} -m pip install {files}")
             return None
         if not create_venv():
             return None
@@ -584,22 +638,54 @@ def shell_quote(text):
 
 
 def run_command_hint(python):
+    """The lines to paste to start the bot by hand.
+
+    One "cd … && …" line on POSIX. Two lines on Windows: Windows PowerShell
+    5.1, the default shell there, rejects "&&", and cmd has no separator that
+    PowerShell also accepts.
+
+    With no `python` (setup_venv() didn't finish), a venv that exists anyway
+    is named, in install-service.sh's order: a failed pip install leaves
+    ./venv behind, the hint before this one says to install the libraries
+    there, and "python3" would then run the system Python without them.
+    """
+    if python is None:
+        python = next(
+            (
+                path
+                for path in (venv_python(), venv_python(os.path.join(HERE, ".venv")))
+                if os.path.exists(path)
+            ),
+            None,
+        )
     shown = os.path.relpath(python, HERE) if python else "python3"
-    return f"cd {shell_quote(HERE)} && {shell_quote(shown)} reminder_bot.py"
+    cd, run_bot = f"cd {shell_quote(HERE)}", f"{shell_quote(shown)} reminder_bot.py"
+    if os.name == "nt":
+        return [cd, run_bot]
+    return [f"{cd} && {run_bot}"]
 
 
-def offer_service(python):
+def offer_service(python, platforms):
     heading("Background service")
     can_install = sys.platform.startswith("linux") and shutil.which("systemctl")
     if not can_install:
         print("systemd isn't available here, so the bot can't be installed as a service.")
         print("Start it by hand with:")
-        print(f"    {run_command_hint(python)}")
+        for line in run_command_hint(python):
+            print(f"    {line}")
         return
 
-    if python is None:
-        print("The libraries aren't installed in ./venv, so the service would use the")
-        print("system Python. Make sure the libraries are installed there first.")
+    if python is None and os.path.exists(venv_python()):
+        # install-service.sh runs the bot with ./venv whenever it exists, so
+        # libraries installed into the system Python would never be used.
+        files = " ".join(f"-r requirements-{p}.txt" for p in platforms)
+        shown = shell_quote(os.path.relpath(venv_python(), HERE))
+        print("./venv exists but the libraries aren't installed in it, and the service")
+        print("would run with ./venv. Install them there first:")
+        print(f"    {shown} -m pip install {files}")
+    elif python is None:
+        print("There is no ./venv, so the service would use the system Python. Make")
+        print("sure the libraries are installed there first.")
 
     if ask_yes_no(
         "Install (or update) the bot as a service that runs in the background and\n"
@@ -612,7 +698,9 @@ def offer_service(python):
         return
 
     print("Skipped. You can:")
-    print(f"  • start the bot by hand:   {run_command_hint(python)}")
+    print("  • start the bot by hand:")
+    for line in run_command_hint(python):
+        print(f"      {line}")
     print("  • install the service later: ./install-service.sh")
     print("If the bot already runs as a service, restart it to pick up the new settings:")
     print(f"    sudo systemctl restart {SERVICE_NAME}")
@@ -644,7 +732,14 @@ def run():
         if not ask_yes_no("Continue as root anyway?", default=False):
             return 1
 
-    existing = read_conf_file(CONF_FILE)
+    try:
+        existing = read_conf_file(CONF_FILE)
+    except ConfFileError as e:
+        # Nothing in it can be offered as a default, but saving still keeps
+        # the old file as conf.env.bak, so starting afresh loses nothing.
+        print(f"\n! {e}")
+        print("  Starting from empty settings; saving keeps the old file as conf.env.bak.")
+        existing = {}
     if existing:
         print("\nFound your existing conf.env — press Enter at a question to keep its value.")
 
@@ -670,7 +765,7 @@ def run():
     print(f"  ✓ Saved conf.env, readable only by you{backup_note}.")
 
     python = setup_venv(platforms)
-    offer_service(python)
+    offer_service(python, platforms)
 
     print("\nAll done.")
     if "telegram" in platforms:
@@ -682,6 +777,13 @@ def run():
 
 
 def main():
+    # On Windows, output that isn't a console window (Git Bash's default
+    # terminal, a pipe) is encoded with the ANSI code page, which has no
+    # "✓" or "→": printing one ended the wizard in a UnicodeEncodeError
+    # before anything was saved. Show a "?" instead.
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(errors="replace")
     try:
         return run()
     except Cancelled:

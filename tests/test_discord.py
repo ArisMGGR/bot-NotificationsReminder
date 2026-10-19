@@ -341,6 +341,17 @@ def test_new_form_rejects_bad_input_privately(title, interval):
     assert core.load_reminders() == []
 
 
+def test_a_rejected_interval_is_echoed_escaped():
+    """F-055: the raw answer's backtick paired with the one before /new and
+    swallowed the instructions into a code span."""
+    interaction = FakeInteraction()
+    answer = "`every **day**"
+    run(dc.handle_new_submit(interaction, "ok", answer))
+    text, _ = interaction.response.sent[0]
+    assert dc.esc(answer) in text
+    assert answer not in text
+
+
 def test_new_command_opens_the_form():
     interaction = FakeInteraction()
     run(dc.new_command.callback(interaction))
@@ -387,6 +398,32 @@ def test_custom_ids_round_trip_through_the_templates():
         assert (await dc.ListSelect.from_custom_id(None, None, match)).action == "del"
 
     run(check())
+
+
+@pytest.mark.parametrize("handler", ["handle_ok", "handle_list_action", "handle_close"])
+def test_a_failed_button_or_dropdown_tells_the_user(monkeypatch, handler):
+    """F-041: a failure in a button or dropdown escaped to discord.py, which
+    only logs it, so the user got "This interaction failed" and no apology."""
+    async def fail(*args):
+        raise http_error(discord.NotFound, 404)
+
+    monkeypatch.setattr(dc, handler, fail)
+
+    async def press():
+        item = {
+            "handle_ok": lambda: dc.OkButton(1),
+            "handle_list_action": lambda: dc.ListSelect("reset", [("1. x", 1, "next in 1d")]),
+            "handle_close": dc.CloseButton,
+        }[handler]()
+        item.item._values = ["1"]  # what a dropdown pick sets; ignored by buttons
+        interaction = FakeInteraction()
+        await item.callback(interaction)
+        return interaction
+
+    interaction = run(press())
+    [(text, kwargs)] = interaction.response.sent
+    assert "went wrong" in text
+    assert kwargs["ephemeral"] is True
 
 
 def make_frontend(send_error=None):
@@ -448,6 +485,26 @@ def test_alerts_are_held_for_channels_outside_the_allow_lists(monkeypatch, acces
 
 def test_describe_error_is_registered_with_the_core():
     assert "Discord" in core.describe_error(http_error(discord.Forbidden, 403))
+
+
+@pytest.mark.parametrize(
+    "code,expected,not_expected",
+    [
+        (10062, "interaction expired", "channel"),   # Unknown interaction
+        (10008, "message doesn't exist", "channel"),  # Unknown message
+        (10003, "channel doesn't exist", None),      # Unknown channel
+    ],
+)
+def test_not_found_is_described_by_its_code(code, expected, not_expected):
+    """F-049: every NotFound read as a deleted channel, so an interaction the
+    bot answered too late was logged as a channel problem."""
+    error = discord.NotFound(
+        SimpleNamespace(status=404, reason="Not Found"), {"code": code, "message": "x"},
+    )
+    text = core.describe_error(error)
+    assert expected in text
+    if not_expected:
+        assert not_expected not in text
 
 
 def log_from_discord_client(error, message, *args):

@@ -7,6 +7,7 @@ the /list budget can be checked without a token or a network.
 
 import asyncio
 import datetime
+import logging
 import os
 from types import SimpleNamespace
 
@@ -506,6 +507,58 @@ def test_a_group_that_became_a_supergroup_gets_its_reminders_there(monkeypatch):
         assert "moved to chat -100123" in f.read()
 
 
+def migration_message(chat_id, to=None, came_from=None):
+    return SimpleNamespace(
+        chat_id=chat_id, migrate_to_chat_id=to, migrate_from_chat_id=came_from,
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        migration_message(-4711, to=-100123),          # in the old group
+        migration_message(-100123, came_from=-4711),   # in the new supergroup
+    ],
+)
+def test_a_reminder_waiting_for_ok_follows_its_group_to_the_supergroup(message):
+    """F-065: reminders moved only when an alert to the old id failed, and an
+    alert already sent is never sent again, so a reminder waiting for OK was
+    left under the dead id: missing from the supergroup's /list, its buttons
+    there finding nothing, and never firing again. Either status message
+    alone must move it."""
+    write_store([
+        make_reminder(id=1, chat_id=-4711, last_reset=0.0, alerting=True),
+        make_reminder(id=2, chat_id=42),
+    ])
+    update = SimpleNamespace(effective_message=message)
+    asyncio.run(tg.on_migration(update, make_context()))
+
+    assert [r["id"] for r in asyncio.run(core.reminders_for("telegram", -100123))] == [1]
+    assert {r["id"]: r["chat_id"] for r in read_store()} == {1: -100123, 2: 42}
+    # The other status message, or a later ChatMigrated, finds nothing to move.
+    asyncio.run(tg.follow_migration(-4711, -100123))
+    assert {r["id"]: r["chat_id"] for r in read_store()} == {1: -100123, 2: 42}
+    query = press("ok:1", chat_id=-100123)
+    assert "timer restarted" in query.edits[0][0]
+    assert read_store()[0]["alerting"] is False
+
+
+def test_migration_status_messages_reach_the_handler():
+    app = tg.build_application("123456:" + "A" * 35)  # builds offline
+    [handler] = [
+        h for h in app.handlers[0] if getattr(h, "callback", None) is tg.on_migration
+    ]
+    old_group = Message(
+        1, datetime.datetime.now(), Chat(-4711, "group"), migrate_to_chat_id=-100123,
+    )
+    plain = Message(
+        2, datetime.datetime.now(), Chat(-4711, "group"),
+        from_user=User(7, "u", False), text="hello",
+    )
+    assert handler.check_update(Update(1, message=old_group))
+    assert not handler.check_update(Update(2, message=plain))
+
+
 def test_alerts_are_held_for_chats_outside_the_allow_list(monkeypatch):
     """F-019: an allow-listed bot must not keep posting to excluded chats."""
     frontend = make_frontend()
@@ -594,6 +647,34 @@ def test_an_allow_list_with_no_valid_id_blocks_every_chat(monkeypatch):
     with pytest.raises(tg.ApplicationHandlerStop):
         asyncio.run(tg.restrict_to_allowed_chats(make_update(chat_id=99), make_context()))
     assert make_frontend().accepts(make_reminder(chat_id=99)) is False
+
+
+def test_log_lines_name_the_allow_list_setting_in_use(monkeypatch):
+    """F-063: with only the older ALLOWED_CHAT_IDS set, the log said to edit
+    TELEGRAM_ALLOWED_CHAT_IDS; doing that made the new name win and locked out
+    every chat the old list allowed."""
+    monkeypatch.setenv("ALLOWED_CHAT_IDS", "1")
+    monkeypatch.setattr(tg, "ALLOWED_CHAT_IDS", set())
+    monkeypatch.setattr(tg, "ALLOWED_CHAT_IDS_SETTING", tg.ALLOWED_CHAT_IDS_SETTING)
+    frontend = tg.TelegramFrontend("123456:" + "A" * 35)  # builds offline
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture()
+    tg.log.addHandler(handler)
+    try:
+        with pytest.raises(tg.ApplicationHandlerStop):
+            asyncio.run(tg.restrict_to_allowed_chats(make_update(chat_id=2), make_context()))
+        asyncio.run(tg.follow_migration(1, -100123))  # 1 is allowed, its new id isn't
+    finally:
+        tg.log.removeHandler(handler)
+
+    named = [m for m in messages if "ALLOWED_CHAT_IDS" in m]
+    assert len(named) == 2, messages
+    assert not any("TELEGRAM_ALLOWED_CHAT_IDS" in m for m in named), named
 
 
 def test_guard_runs_before_every_other_handler():

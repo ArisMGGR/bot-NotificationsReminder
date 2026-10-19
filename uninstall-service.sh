@@ -7,6 +7,7 @@
 #   ./uninstall-service.sh
 #
 # Stops the service, stops it starting on boot, and deletes the unit file.
+# The old telegram-reminder-bot service from earlier versions goes the same way.
 #
 # Your reminders, logs, conf.env and venv are NOT touched. install-service.sh only ever
 # created the unit file, so that is all this removes; the data belongs to you
@@ -17,7 +18,11 @@
 set -euo pipefail
 
 SERVICE_NAME="reminder-bot"
-UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# The name the service had before the bot supported Discord. install-service.sh
+# retires it, but a machine that never re-ran the installer may still have it,
+# running with the same token.
+LEGACY_SERVICE_NAME="telegram-reminder-bot"
 
 # Directory this script sits in = the project directory.
 WORKDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,65 +46,94 @@ if ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
-# Removing a unit from /etc needs root. Skip sudo when we already are root, so
-# this still works on a system that doesn't have sudo installed.
-if [[ "$(id -u)" -eq 0 ]]; then
-    SUDO=""
-elif command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-else
-    echo "Error: need root to remove $UNIT, and sudo isn't installed." >&2
-    echo "Re-run this script as root." >&2
-    exit 1
-fi
-
 # --- Work out what's actually there -----------------------------------------
+
+unit_file() {
+    echo "/etc/systemd/system/$1.service"
+}
 
 # systemctl exits non-zero for a unit that is inactive, disabled or unknown —
 # all normal answers here. Under `set -e` an unguarded query would abort the
 # script instead of telling us what we asked, so every one is guarded.
 query() {
-    systemctl "$1" "$SERVICE_NAME" 2>/dev/null || true
+    systemctl "$1" "$2" 2>/dev/null || true
 }
 
-IS_ACTIVE="$(query is-active)"
-IS_ENABLED="$(query is-enabled)"
+installed() {
+    [[ -f "$(unit_file "$1")" \
+        || "$(query is-active "$1")" == "active" \
+        || "$(query is-enabled "$1")" == "enabled" ]]
+}
 
-if [[ ! -f "$UNIT" && "$IS_ACTIVE" != "active" && "$IS_ENABLED" != "enabled" ]]; then
+# Space-separated; neither name contains a space.
+FOUND=""
+for name in "$SERVICE_NAME" "$LEGACY_SERVICE_NAME"; do
+    if installed "$name"; then
+        FOUND+="$name "
+    fi
+done
+
+if [[ -z "$FOUND" ]]; then
     echo "Nothing to do: $SERVICE_NAME is not installed as a systemd service."
-    echo "(No unit file at $UNIT, and the service isn't running or enabled.)"
+    echo "(No unit file at $(unit_file "$SERVICE_NAME"), and the service isn't running or enabled.)"
     exit 0
 fi
 
-echo "Service   : $SERVICE_NAME"
-echo "Unit file : $UNIT$([[ -f "$UNIT" ]] || echo "  (missing)")"
-echo "State     : ${IS_ACTIVE:-unknown}, ${IS_ENABLED:-not enabled}"
-echo
+# Removing a unit from /etc needs root. Checked only once there is something to
+# remove, so "Nothing to do" above never turns into a demand for root. Skip
+# sudo when we already are root, so this works without sudo installed.
+if [[ "$(id -u)" -eq 0 ]]; then
+    SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+else
+    echo "Error: need root to remove the service (${FOUND% }), and sudo isn't installed." >&2
+    echo "Re-run this script as root." >&2
+    exit 1
+fi
 
 # --- Remove it --------------------------------------------------------------
 
-if [[ "$IS_ACTIVE" == "active" ]]; then
-    echo "Stopping the service ..."
-    $SUDO systemctl stop "$SERVICE_NAME"
-else
-    echo "The service isn't running."
-fi
+remove_service() {
+    local name="$1" unit is_active is_enabled
+    unit="$(unit_file "$name")"
+    is_active="$(query is-active "$name")"
+    is_enabled="$(query is-enabled "$name")"
 
-if [[ "$IS_ENABLED" == "enabled" || "$IS_ENABLED" == "enabled-runtime" ]]; then
-    echo "Disabling it so it no longer starts on boot ..."
-    $SUDO systemctl disable "$SERVICE_NAME" >/dev/null
-fi
+    echo "Service   : $name"
+    echo "Unit file : $unit$([[ -f "$unit" ]] || echo "  (missing)")"
+    echo "State     : ${is_active:-unknown}, ${is_enabled:-not enabled}"
 
-if [[ -f "$UNIT" ]]; then
-    echo "Removing $UNIT ..."
-    $SUDO rm -f "$UNIT"
-fi
+    if [[ "$is_active" == "active" ]]; then
+        echo "Stopping the service ..."
+        $SUDO systemctl stop "$name"
+    else
+        echo "The service isn't running."
+    fi
+
+    if [[ "$is_enabled" == "enabled" || "$is_enabled" == "enabled-runtime" ]]; then
+        echo "Disabling it so it no longer starts on boot ..."
+        $SUDO systemctl disable "$name" >/dev/null
+    fi
+
+    if [[ -f "$unit" ]]; then
+        echo "Removing $unit ..."
+        $SUDO rm -f "$unit"
+    fi
+    echo
+}
+
+for name in $FOUND; do
+    remove_service "$name"
+done
 
 echo "Reloading systemd ..."
 $SUDO systemctl daemon-reload
-# Clears a lingering "failed" entry so the removed service stops showing up in
+# Clears a lingering "failed" entry so a removed service stops showing up in
 # `systemctl --failed`. Harmless if there wasn't one.
-$SUDO systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+for name in $FOUND; do
+    $SUDO systemctl reset-failed "$name" >/dev/null 2>&1 || true
+done
 
 # --- What was deliberately left behind --------------------------------------
 
@@ -135,7 +169,17 @@ if [[ -n "$KEPT" ]]; then
     echo
 fi
 
+# Name the Python install-service.sh would have picked, in its order: a service
+# installed without ./venv ran on the system python3, and "venv/bin/python"
+# would then be a command that doesn't exist.
+if [[ -x "$WORKDIR/venv/bin/python" ]]; then
+    RUN_PYTHON="venv/bin/python"
+elif [[ -x "$WORKDIR/.venv/bin/python" ]]; then
+    RUN_PYTHON=".venv/bin/python"
+else
+    RUN_PYTHON="python3"
+fi
 echo "You can still run the bot by hand at any time:"
 # %q quotes the path, so the line still works when pasted if it has spaces.
-printf '    cd %q && venv/bin/python reminder_bot.py\n' "$WORKDIR"
+printf '    cd %q && %s reminder_bot.py\n' "$WORKDIR" "$RUN_PYTHON"
 echo "To set the service back up:  ./install-service.sh"

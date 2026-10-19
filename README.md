@@ -95,7 +95,8 @@ minute to appear the first time.
 
 Reminders belong to the chat (Telegram) or channel/DM (Discord) they were made
 in, and each platform keeps its own — a Telegram chat and a Discord channel
-never see each other's reminders.
+never see each other's reminders. A Telegram group that is upgraded to a
+supergroup keeps its reminders.
 
 When a reminder is due, the bot posts it with an **✅ OK** button — press it to
 restart the timer.
@@ -199,10 +200,13 @@ To remove the service again, run the uninstaller from the project folder:
 ./uninstall-service.sh
 ```
 
-It stops the service, stops it starting on boot, and deletes the unit file. It
+It stops the service, stops it starting on boot, and deletes the unit file (the
+old `telegram-reminder-bot` service too, if it is still installed). It
 deliberately leaves your `conf.env`, `venv`, reminders and logs alone, and prints
 where they are so you can delete them yourself if you're finished with the bot.
-You can still run `venv/bin/python reminder_bot.py` by hand afterwards.
+You can still run the bot by hand afterwards: `venv/bin/python reminder_bot.py`,
+or `python3 reminder_bot.py` if you never made a `./venv` (the uninstaller
+prints the right one).
 
 The unit runs sandboxed: no new privileges, a private `/tmp`, and a read-only
 view of the filesystem apart from the project folder. If you move the data or
@@ -303,7 +307,8 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest          # the test suite — no token or network needed
 python -m pyflakes reminder_bot.py setup_wizard.py reminderbot tests
-bash -n install-service.sh uninstall-service.sh
+bash -n install-service.sh   # one script per bash -n: it checks only the first file
+bash -n uninstall-service.sh
 ```
 
 The tests drive the handlers with small stand-in objects, so they cover the

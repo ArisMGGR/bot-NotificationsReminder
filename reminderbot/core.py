@@ -207,7 +207,13 @@ class DedupWarningFilter(logging.Filter):
         if record.levelno < logging.WARNING:
             self._last_warning = None  # a non-warning breaks the run
             return True
+        # The attached exception counts too: "Unexpected error while handling
+        # a Telegram update:" is the same text for every unknown bug, and
+        # keying on the text alone dropped a second, different bug's traceback.
+        error = record.exc_info[1] if record.exc_info else None
         message = record.getMessage()
+        if error is not None:
+            message = (message, type(error), str(error))
         # Deliberately compares against the last *written* line: advancing the
         # timestamp on every suppressed repeat would keep the window open
         # forever during a persistent outage.
@@ -396,8 +402,8 @@ def load_store():
     "Unusable" covers the entries too, not just the top-level shape: valid JSON
     holding the wrong thing (a list of numbers, entries missing chat_id) would
     otherwise be accepted here and crash every caller afterwards. It also
-    covers text that isn't UTF-8 (a hand edit saved in another encoding), and
-    two entries sharing an id: every lookup is by id, so a Delete in one chat
+    covers text that isn't UTF-8 (a hand edit saved in another encoding), a
+    number too long for Python to convert, and two entries sharing an id: every lookup is by id, so a Delete in one chat
     would take the other chat's reminder with it.
 
     "next_id" is the id the next new reminder gets. It only ever grows, so a
@@ -411,11 +417,14 @@ def load_store():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except json.JSONDecodeError as e:
-        quarantine_data_file(f"it isn't valid JSON ({e})")
-        return {"next_id": 1, "reminders": []}
     except UnicodeDecodeError as e:
         quarantine_data_file(f"it isn't UTF-8 text ({e})")
+        return {"next_id": 1, "reminders": []}
+    except ValueError as e:
+        # JSONDecodeError, and also the plain ValueError json raises for an
+        # integer longer than Python's int conversion limit (4300 digits):
+        # caught too, or the file would stay put and fail every load.
+        quarantine_data_file(f"it can't be read as JSON ({e})")
         return {"next_id": 1, "reminders": []}
     if isinstance(data, list):
         reminders, stored_next_id = data, 1
@@ -855,6 +864,26 @@ def record_rejected(reminder, error, last_reset_when_sent):
     return True
 
 
+async def save_delivered(reminder):
+    """Record that `reminder` was sent. Returns False if the file can't be written.
+
+    The alert has already gone out, so a failed write must not end the tick
+    (the other due reminders still need sending) or pass unexplained; the
+    caller keeps the reminder from being sent again meanwhile.
+    """
+    try:
+        await update_reminder(reminder["id"], mark_delivered(reminder["last_reset"]))
+    except OSError as e:
+        log.error(
+            "Sent reminder #%s (%s) but couldn't save that it was sent: %s. It "
+            "won't be sent again while the bot runs. Fix the cause (often a full "
+            "or read-only disk) so it can be saved.",
+            reminder["id"], loggable(reminder["title"]), e,
+        )
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Background loops
 # ---------------------------------------------------------------------------
@@ -879,6 +908,11 @@ async def check_reminders(senders):
     retrying could never succeed, so the reminder is stood down after one
     attempt rather than looping forever.
     """
+    # Reminders that were sent but whose "alerting" flag couldn't be saved
+    # (a full or read-only disk): id -> last_reset at the time of the send.
+    # The file still says they are due, so without this every tick would
+    # send the same alert again, every CHECK_INTERVAL seconds.
+    unsaved = {}
     while True:
         try:
             async with store_lock:
@@ -904,6 +938,13 @@ async def check_reminders(senders):
                         None,
                     )
                 if r is None or not needs_alert(r):
+                    unsaved.pop(stale["id"], None)
+                    continue
+                if unsaved.get(r["id"]) == r["last_reset"]:
+                    # Already delivered; only the record of it is missing.
+                    # Try to save that again instead of re-sending.
+                    if await save_delivered(r):
+                        del unsaved[r["id"]]
                     continue
                 try:
                     await senders[r["platform"]].send_alert(r)
@@ -940,7 +981,10 @@ async def check_reminders(senders):
                     # cycle). Re-read under the lock rather than writing the
                     # list we started from — a /new, Delete or Reset may have
                     # landed while we were waiting on the network.
-                    await update_reminder(r["id"], mark_delivered(r["last_reset"]))
+                    if await save_delivered(r):
+                        unsaved.pop(r["id"], None)
+                    else:
+                        unsaved[r["id"]] = r["last_reset"]
         except Exception as e:  # keep the loop alive no matter what
             friendly = describe_error(e)
             if friendly:

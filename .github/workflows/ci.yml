@@ -39,5 +39,9 @@ jobs:
       - name: Test
         run: python -m pytest -q
 
+      # One bash -n per script: bash parses only the first file it is given
+      # and passes the rest to it as arguments, unchecked.
       - name: Check the shell scripts parse
-        run: bash -n install-service.sh uninstall-service.sh
+        run: |
+          bash -n install-service.sh
+          bash -n uninstall-service.sh
