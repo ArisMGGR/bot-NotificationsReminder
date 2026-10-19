@@ -544,6 +544,9 @@ def test_a_reminder_waiting_for_ok_follows_its_group_to_the_supergroup(message):
 
 
 def test_migration_status_messages_reach_the_handler():
+    """F-068: both status messages must be dispatched. With an allow-list that
+    holds only the supergroup's id, the old group's message is refused by the
+    guard, and the supergroup's is the only one that can move the reminders."""
     app = tg.build_application("123456:" + "A" * 35)  # builds offline
     [handler] = [
         h for h in app.handlers[0] if getattr(h, "callback", None) is tg.on_migration
@@ -551,11 +554,15 @@ def test_migration_status_messages_reach_the_handler():
     old_group = Message(
         1, datetime.datetime.now(), Chat(-4711, "group"), migrate_to_chat_id=-100123,
     )
+    new_supergroup = Message(
+        3, datetime.datetime.now(), Chat(-100123, "supergroup"), migrate_from_chat_id=-4711,
+    )
     plain = Message(
         2, datetime.datetime.now(), Chat(-4711, "group"),
         from_user=User(7, "u", False), text="hello",
     )
     assert handler.check_update(Update(1, message=old_group))
+    assert handler.check_update(Update(3, message=new_supergroup))
     assert not handler.check_update(Update(2, message=plain))
 
 

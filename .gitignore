@@ -9,11 +9,11 @@ missed_notifications.log
 missed_notifications.log.*
 logs/
 
-# Credentials
+# Credentials (conf.env and any copy of it; the example stays tracked)
 token.txt
 conf.env
-conf.env.bak
-conf.env.tmp
+conf.env.*
+!conf.env.example
 .env
 
 # Python
@@ -26,6 +26,8 @@ venv/
 
 # Audit notes, not for publication
 tests/FINDINGS.md
+tests/LOG.md
+tests/VERIFY.md
 
 # Editors and OS clutter
 .DS_Store
