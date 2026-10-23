@@ -19,6 +19,20 @@ PLATFORMS = ("telegram", "discord")
 log = logging.getLogger("reminder_bot")
 
 
+class ConfFileError(Exception):
+    """conf.env exists but can't be read as text. The message says how to fix it."""
+
+
+def conf_not_utf8(path):
+    # An editor saving as "ANSI" (Windows-1252) turns the example's "—" into a
+    # byte UTF-8 can't decode, which used to end the bot and the wizard in a
+    # raw UnicodeDecodeError traceback.
+    return ConfFileError(
+        f"{path} isn't UTF-8 text, so the settings in it can't be read. "
+        "Save it again as UTF-8."
+    )
+
+
 def read_conf_file(path=CONF_FILE):
     """Parse a KEY=value file into an ordered dict. Missing file -> {}.
 
@@ -27,29 +41,35 @@ def read_conf_file(path=CONF_FILE):
     "#" starts a comment, as in python-dotenv: the bot reads conf.env with
     dotenv, so reading "123  # servers" as anything but "123" here would make
     setup_wizard.py offer a different value from the one the bot uses.
+
+    Raises ConfFileError if the file isn't UTF-8.
     """
     values = {}
     if not os.path.exists(path):
         return values
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            if key.startswith("export "):
-                key = key[len("export "):].strip()
-            if not key:
-                # "=value": nothing to set, and os.environ rejects an empty
-                # name, so load_conf_file() would crash the bot on it.
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            elif value[:1] not in "\"'":
-                value = re.sub(r"\s+#.*", "", value)
-            values[key] = value
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        raise conf_not_utf8(path) from None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        if not key:
+            # "=value": nothing to set, and os.environ rejects an empty
+            # name, so load_conf_file() would crash the bot on it.
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        elif value[:1] not in "\"'":
+            value = re.sub(r"\s+#.*", "", value)
+        values[key] = value
     return values
 
 
@@ -57,16 +77,59 @@ def load_conf_file(path=CONF_FILE):
     """Load conf.env into os.environ. Existing variables are never overwritten.
 
     Uses python-dotenv if it's installed; otherwise falls back to the small
-    parser above so conf.env still works without the extra package.
+    parser above so conf.env still works without the extra package. Raises
+    ConfFileError if the file isn't UTF-8, whichever reader is used.
     """
     try:
         from dotenv import load_dotenv  # type: ignore
-        load_dotenv(path)
-        return
     except ImportError:
-        pass
+        load_dotenv = None
+    if load_dotenv is not None:
+        try:
+            load_dotenv(path)
+        except UnicodeDecodeError:
+            raise conf_not_utf8(path) from None
+        return
     for key, value in read_conf_file(path).items():
         os.environ.setdefault(key, value)
+
+
+class TokenFileError(Exception):
+    """token.txt exists but holds no usable token. The message says how to fix it."""
+
+
+def read_token_file(path=TOKEN_FILE):
+    """The Telegram token saved in token.txt, or "" if there is no such file.
+
+    Editors on Windows add a byte-order mark (Notepad's UTF-8, PowerShell 5's
+    Out-File, which also writes UTF-16). Read as plain UTF-8, the mark would
+    stay glued to the token, which Telegram then rejects as invalid, and a
+    UTF-16 file would end the bot and the wizard in a UnicodeDecodeError.
+
+    Raises TokenFileError if the file can't be decoded, or holds anything
+    besides the token: a second line ("# my bot") used to become part of the
+    token, and the bot then stopped with a misleading "Network hiccup".
+    """
+    if not os.path.exists(path):
+        return ""
+    with open(path, "rb") as f:
+        raw = f.read()
+    encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError:
+        raise TokenFileError(
+            f"{path} isn't UTF-8 text, so the Telegram token in it can't be "
+            "read. Save it again as UTF-8, or set TELEGRAM_BOT_TOKEN in conf.env."
+        ) from None
+    token = text.strip()
+    if len(token.split()) > 1:
+        raise TokenFileError(
+            f"{path} holds more than the Telegram token (a second line, or "
+            "spaces). Leave only the token in it, or set TELEGRAM_BOT_TOKEN "
+            "in conf.env."
+        )
+    return token
 
 
 def parse_id_list(raw, name="the id list"):
@@ -80,6 +143,11 @@ def parse_id_list(raw, name="the id list"):
     return ids
 
 
+def first_set(*names):
+    """The first of `names` set to something other than blanks, or None."""
+    return next((name for name in names if os.environ.get(name, "").strip()), None)
+
+
 def id_list_from_env(*names):
     """Read the first of `names` that is set in the environment as an id set.
 
@@ -88,18 +156,17 @@ def id_list_from_env(*names):
     comes back as {DENY_ALL}, which no id matches: a typo in an allow-list
     locks the bot down instead of silently opening it to everyone.
     """
-    for name in names:
-        raw = os.environ.get(name, "").strip()
-        if raw:
-            ids = parse_id_list(raw, name)
-            if not ids:
-                log.error(
-                    "%s is set but holds no valid id, so nobody is allowed "
-                    "until it is fixed. Ids are numbers; see the README.", name,
-                )
-                return {DENY_ALL}
-            return ids
-    return set()
+    name = first_set(*names)
+    if name is None:
+        return set()
+    ids = parse_id_list(os.environ[name], name)
+    if not ids:
+        log.error(
+            "%s is set but holds no valid id, so nobody is allowed "
+            "until it is fixed. Ids are numbers; see the README.", name,
+        )
+        return {DENY_ALL}
+    return ids
 
 
 class _DenyAll:

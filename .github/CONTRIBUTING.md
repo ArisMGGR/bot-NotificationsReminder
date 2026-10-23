@@ -22,7 +22,8 @@ Run what CI runs:
 python -m pytest -q
 python -m pyflakes reminder_bot.py setup_wizard.py reminderbot tests
 python -m compileall -q reminder_bot.py setup_wizard.py reminderbot
-bash -n install-service.sh uninstall-service.sh
+bash -n install-service.sh   # one script per bash -n: it checks only the first file
+bash -n uninstall-service.sh
 ```
 
 CI runs these on Python 3.10 and 3.13. 3.10 is the supported floor.

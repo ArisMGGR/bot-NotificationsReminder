@@ -116,9 +116,13 @@ def test_load_reminders_quarantines_malformed_entries(payload):
 
 
 def test_load_reminders_quarantines_invalid_json():
+    """F-057: this used to check only the empty result, so dropping the
+    quarantine left the damaged file for the next save to overwrite."""
     with open(core.DATA_FILE, "w", encoding="utf-8") as f:
         f.write("{not json")
     assert core.load_reminders() == []
+    assert not os.path.exists(core.DATA_FILE)
+    assert any(".corrupt." in n for n in os.listdir(os.path.dirname(core.DATA_FILE)))
 
 
 def test_load_reminders_quarantines_text_that_isnt_utf8():
@@ -126,6 +130,17 @@ def test_load_reminders_quarantines_text_that_isnt_utf8():
     raw = json.dumps([make_reminder(title="café")], ensure_ascii=False)
     with open(core.DATA_FILE, "wb") as f:
         f.write(raw.encode("latin-1"))
+    assert core.load_reminders() == []
+    assert not os.path.exists(core.DATA_FILE)
+    assert any(".corrupt." in n for n in os.listdir(os.path.dirname(core.DATA_FILE)))
+
+
+def test_load_reminders_quarantines_a_number_too_long_to_convert():
+    """F-048: json raises a plain ValueError (not JSONDecodeError) for an
+    integer past Python's 4300-digit limit, so the file stayed in place and
+    every load raised. Written by hand: json.dump can't write such a number."""
+    with open(core.DATA_FILE, "w", encoding="utf-8") as f:
+        f.write('[{"id": 1, "chat_id": ' + "9" * 5000 + "}]")
     assert core.load_reminders() == []
     assert not os.path.exists(core.DATA_FILE)
     assert any(".corrupt." in n for n in os.listdir(os.path.dirname(core.DATA_FILE)))
@@ -481,6 +496,35 @@ def test_loop_keeps_retrying_an_undelivered_reminder(monkeypatch):
         assert "MISSED" in f.read()
 
 
+def test_a_sent_alert_is_not_sent_again_when_it_cannot_be_saved(monkeypatch):
+    """F-059: with the "sent" flag unsaved (full or read-only disk), the file
+    still said the reminder was due, so every tick sent the same alert again."""
+    write_store([overdue(id=1), overdue(id=2)])
+    real_save = core.save_store
+    saves = []
+
+    def failing_save(store):
+        saves.append(1)
+        if len(saves) <= 4:  # the first two ticks: one save per reminder
+            raise OSError(28, "No space left on device")
+        real_save(store)
+
+    monkeypatch.setattr(core, "save_store", failing_save)
+    ticks = []
+
+    async def sleep(_seconds):
+        ticks.append(1)
+        if len(ticks) == 3:
+            raise _StopLoop
+
+    monkeypatch.setattr(core.asyncio, "sleep", sleep)
+    sender = FakeSender()
+    with pytest.raises(_StopLoop):
+        asyncio.run(core.check_reminders({"telegram": sender}))
+    assert sender.sent == [1, 2], "each alert sent once, and a failed save skips no one"
+    assert all(r["alerting"] for r in read_store()), "saved once the disk recovered"
+
+
 def test_loop_survives_an_unexpected_sender_error(monkeypatch):
     write_store([overdue(id=1), overdue(id=2)])
     sender = FakeSender(RuntimeError("boom"))
@@ -590,6 +634,23 @@ def test_dedup_does_not_extend_the_window_on_suppressed_repeats(monkeypatch):
         assert dedup.filter(make_warning("Bad Gateway")) is False
     clock[0] += 10  # now 100s since the line we wrote
     assert dedup.filter(make_warning("Bad Gateway")) is True
+
+
+def make_error_record(message, error):
+    return logging.LogRecord(
+        "test", logging.ERROR, __file__, 1, message, None, (type(error), error, None)
+    )
+
+
+def test_dedup_keeps_a_different_exception_with_the_same_message():
+    """F-050: every unknown bug logs the same text, so keying on the text alone
+    dropped the second bug's traceback from the console and the daily file."""
+    dedup = core.DedupWarningFilter(reset_after=1800)
+    text = "Unexpected error while handling a Telegram update:"
+    assert dedup.filter(make_error_record(text, ValueError("first bug"))) is True
+    assert dedup.filter(make_error_record(text, KeyError("second bug"))) is True
+    # The same failure recurring is still collapsed.
+    assert dedup.filter(make_error_record(text, KeyError("second bug"))) is False
 
 
 def test_dedup_resets_explicitly():

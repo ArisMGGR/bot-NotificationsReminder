@@ -60,6 +60,13 @@ MAX_LIST_UNITS = 3800
 # restriction": anyone who finds the bot can create reminders in their chat.
 ALLOWED_CHAT_IDS = set()
 
+# The settings the allow-list is read from, newest name first, and the one it
+# was actually read from. Log lines name that one: telling someone with only
+# the older name to edit TELEGRAM_ALLOWED_CHAT_IDS would make the new name
+# win and lock out every chat the old list allowed.
+ALLOWED_CHAT_IDS_NAMES = ("TELEGRAM_ALLOWED_CHAT_IDS", "ALLOWED_CHAT_IDS")
+ALLOWED_CHAT_IDS_SETTING = ALLOWED_CHAT_IDS_NAMES[0]
+
 # Conversation states for the /new flow.
 ASK_TITLE, ASK_INTERVAL = range(2)
 
@@ -369,6 +376,46 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await refresh_list_message(query, chat_id, context)
 
 
+async def follow_migration(old_chat_id, new_chat_id):
+    """Move a group's reminders to the id it got as a supergroup.
+
+    Telegram sends a status message to both the old and the new chat, and a
+    send to the old id fails with ChatMigrated; whichever comes first moves
+    the reminders, and the others find nothing left to move.
+    """
+    moved = await core.move_chat(PLATFORM, old_chat_id, new_chat_id)
+    if moved:
+        log.warning(
+            "Telegram group %s became supergroup %s; moved its %d reminder(s) there.",
+            old_chat_id, new_chat_id, moved,
+        )
+    if (
+        ALLOWED_CHAT_IDS
+        and old_chat_id in ALLOWED_CHAT_IDS
+        and new_chat_id not in ALLOWED_CHAT_IDS
+    ):
+        log.warning(
+            "Add %s to %s in conf.env and restart: the group's new id "
+            "isn't allowed, so its reminders are held until it is.",
+            new_chat_id, ALLOWED_CHAT_IDS_SETTING,
+        )
+
+
+async def on_migration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A group became a supergroup: its reminders move to the new chat id.
+
+    Waiting for an alert to the old id to fail isn't enough. A reminder that
+    was already sent and is waiting for OK is never sent again, so it never
+    moved: the supergroup's /list didn't show it, its buttons there found
+    nothing, and it never fired again.
+    """
+    message = update.effective_message
+    if message.migrate_to_chat_id:  # the status message in the old group
+        await follow_migration(message.chat_id, message.migrate_to_chat_id)
+    else:  # the one in the new supergroup
+        await follow_migration(message.migrate_from_chat_id, message.chat_id)
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
@@ -471,7 +518,7 @@ def load_allowed_chat_ids():
     comma-separated list of chat ids to serve only those chats. The older
     name ALLOWED_CHAT_IDS is still read if the new one isn't set.
     """
-    return config.id_list_from_env("TELEGRAM_ALLOWED_CHAT_IDS", "ALLOWED_CHAT_IDS")
+    return config.id_list_from_env(*ALLOWED_CHAT_IDS_NAMES)
 
 
 async def restrict_to_allowed_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -485,8 +532,8 @@ async def restrict_to_allowed_chats(update: Update, context: ContextTypes.DEFAUL
     chat = update.effective_chat
     if chat is None or chat.id not in ALLOWED_CHAT_IDS:
         log.warning(
-            "Ignoring a Telegram update from chat %s — not in TELEGRAM_ALLOWED_CHAT_IDS.",
-            chat.id if chat else "unknown",
+            "Ignoring a Telegram update from chat %s — not in %s.",
+            chat.id if chat else "unknown", ALLOWED_CHAT_IDS_SETTING,
         )
         raise ApplicationHandlerStop
 
@@ -497,11 +544,13 @@ async def restrict_to_allowed_chats(update: Update, context: ContextTypes.DEFAUL
 
 
 def get_token():
-    """TELEGRAM_BOT_TOKEN from the environment/conf.env, else token.txt."""
+    """TELEGRAM_BOT_TOKEN from the environment/conf.env, else token.txt.
+
+    Raises config.TokenFileError if token.txt is there but holds no usable token.
+    """
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if not token and os.path.exists(config.TOKEN_FILE):
-        with open(config.TOKEN_FILE, "r", encoding="utf-8") as f:
-            token = f.read().strip()
+    if not token:
+        token = config.read_token_file(config.TOKEN_FILE)
     return token
 
 
@@ -533,6 +582,7 @@ def build_application(token):
     # rather than being repeated in every handler.
     app.add_handler(TypeHandler(Update, restrict_to_allowed_chats), group=-1)
 
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_migration))
     app.add_handler(CommandHandler("start", start, filters=new_messages))
     app.add_handler(CommandHandler("help", help_command, filters=new_messages))
     app.add_handler(CommandHandler("list", list_reminders, filters=new_messages))
@@ -548,8 +598,12 @@ class TelegramFrontend:
     platform = PLATFORM
 
     def __init__(self, token):
+        global ALLOWED_CHAT_IDS_SETTING
         ALLOWED_CHAT_IDS.clear()
         ALLOWED_CHAT_IDS.update(load_allowed_chat_ids())
+        ALLOWED_CHAT_IDS_SETTING = (
+            config.first_set(*ALLOWED_CHAT_IDS_NAMES) or ALLOWED_CHAT_IDS_NAMES[0]
+        )
         if ALLOWED_CHAT_IDS:
             log.info(
                 "Telegram: serving %d allow-listed chat(s); all other chats are ignored.",
@@ -643,7 +697,7 @@ class TelegramFrontend:
         except ChatMigrated as e:
             # The group became a supergroup under a new id. Must come before
             # the TelegramError catch below, which would retry the dead id forever.
-            await self._follow_migration(reminder["chat_id"], e.new_chat_id)
+            await follow_migration(reminder["chat_id"], e.new_chat_id)
             raise core.DeliveryRetry(
                 e, f"the group moved to chat {e.new_chat_id}; retrying there",
             ) from e
@@ -660,21 +714,3 @@ class TelegramFrontend:
             # spelled out rather than reusing the outage wording, which would
             # send the operator hunting a network fault that isn't there.
             raise core.DeliveryRetry(e, "the Telegram API call failed") from e
-
-    async def _follow_migration(self, old_chat_id, new_chat_id):
-        """Move a migrated group's reminders to its new id; the next tick delivers."""
-        moved = await core.move_chat(PLATFORM, old_chat_id, new_chat_id)
-        log.warning(
-            "Telegram group %s became supergroup %s; moved its %d reminder(s) there.",
-            old_chat_id, new_chat_id, moved,
-        )
-        if (
-            ALLOWED_CHAT_IDS
-            and old_chat_id in ALLOWED_CHAT_IDS
-            and new_chat_id not in ALLOWED_CHAT_IDS
-        ):
-            log.warning(
-                "Add %s to TELEGRAM_ALLOWED_CHAT_IDS in conf.env and restart: the "
-                "group's new id isn't allowed, so its reminders are held until it is.",
-                new_chat_id,
-            )

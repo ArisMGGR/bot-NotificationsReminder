@@ -5,6 +5,7 @@ venv and service steps are replaced with stand-ins, so the whole flow can be
 checked without typing, a token, or touching the real conf.env.
 """
 
+import io
 import os
 import urllib.error
 
@@ -51,7 +52,9 @@ def script(monkeypatch, answers):
 def skip_install_steps(monkeypatch):
     calls = {}
     monkeypatch.setattr(sw, "setup_venv", lambda platforms: calls.setdefault("venv", platforms))
-    monkeypatch.setattr(sw, "offer_service", lambda python: calls.setdefault("service", python))
+    monkeypatch.setattr(
+        sw, "offer_service", lambda python, platforms: calls.setdefault("service", python),
+    )
     return calls
 
 
@@ -75,11 +78,27 @@ def test_telegram_ids_accept_the_readmes_zero(monkeypatch):
 
 def test_run_command_hint_quotes_a_path_with_spaces(monkeypatch):
     monkeypatch.setattr(sw, "HERE", "/home/pi/My Bots/bot")
-    hint = sw.run_command_hint(None)
+    lines = sw.run_command_hint(None)
     if os.name == "nt":
-        assert hint.startswith('cd "/home/pi/My Bots/bot" && ')
+        assert lines[0] == 'cd "/home/pi/My Bots/bot"'
     else:
-        assert hint.startswith("cd '/home/pi/My Bots/bot' && ")
+        assert lines == ["cd '/home/pi/My Bots/bot' && python3 reminder_bot.py"]
+
+
+def test_windows_run_hint_has_no_ampersands(monkeypatch):
+    """F-052: Windows PowerShell 5.1 rejects "&&", so the pasted hint failed."""
+    monkeypatch.setattr(sw, "HERE", r"C:\Users\pi\My Bots\bot")
+    monkeypatch.setattr(sw.os, "name", "nt")
+    lines = sw.run_command_hint(None)
+    assert lines == [r'cd "C:\Users\pi\My Bots\bot"', "python3 reminder_bot.py"]
+    assert not any("&&" in line for line in lines)
+
+
+def test_a_superscript_digit_is_asked_again_not_a_crash(monkeypatch):
+    """F-046: "²".isdigit() is True but int("²") raises, which ended the wizard."""
+    prompts = script(monkeypatch, ["²", "2"])
+    assert sw.ask_choice("Where?", [("telegram", "T"), ("discord", "D")], "telegram") == "discord"
+    assert len(prompts) == 2
 
 
 def test_mask_hides_most_of_a_token():
@@ -100,6 +119,33 @@ def test_default_platforms_from_existing_settings():
     assert sw.default_platforms({"BOT_PLATFORMS": "discord"}) == "discord"
     assert sw.default_platforms({"TELEGRAM_BOT_TOKEN": "x", "DISCORD_BOT_TOKEN": "y"}) == "telegram,discord"
     assert sw.default_platforms({}) == ""
+
+
+@pytest.mark.parametrize(
+    "bot_platforms",
+    ["telgram", "Discord", "discord, myspace", "telegram,discord", "", "  "],
+)
+def test_default_platforms_agrees_with_the_bot(monkeypatch, bot_platforms):
+    """F-067: a BOT_PLATFORMS naming no platform fell back to the tokens here,
+    so the wizard offered Telegram as current while the bot started nothing."""
+    from reminderbot import config
+
+    existing = {"BOT_PLATFORMS": bot_platforms, "TELEGRAM_BOT_TOKEN": TG_TOKEN}
+    monkeypatch.setattr(config, "TOKEN_FILE", sw.TOKEN_FILE)
+    for key, value in existing.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    assert sw.default_platforms(existing) == ",".join(config.enabled_platforms())
+
+
+def test_a_bot_platforms_naming_no_platform_is_pointed_out(monkeypatch, capsys):
+    with open(sw.CONF_FILE, "w", encoding="utf-8") as f:
+        f.write(f"BOT_PLATFORMS=telgram\nTELEGRAM_BOT_TOKEN={TG_TOKEN}\n")
+    skip_install_steps(monkeypatch)
+    script(monkeypatch, ["", "", "", ""])  # platform, token, ids, save
+    assert sw.main() == 0
+    assert "names no platform, so the bot starts none" in capsys.readouterr().out
+    assert read_conf_file(sw.CONF_FILE)["BOT_PLATFORMS"] == "telegram"
 
 
 def test_old_allowed_chat_ids_name_is_offered_as_the_default():
@@ -202,6 +248,26 @@ def test_real_discord_check(monkeypatch):
     assert REAL_CHECK_DISCORD(DC_TOKEN)[0] is False
 
 
+@pytest.mark.parametrize(
+    "check,token",
+    [
+        (REAL_CHECK_TELEGRAM, "123456789:AAAA " + "B" * 31),   # a space: InvalidURL
+        (REAL_CHECK_TELEGRAM, "123456789:ABC-DEF…"),          # the example, pasted
+        (REAL_CHECK_DISCORD, "MTIz….Gh1b2c.abc…"),
+        (REAL_CHECK_DISCORD, DC_TOKEN + " x"),
+    ],
+)
+def test_a_token_no_service_could_accept_is_refused_offline(monkeypatch, check, token):
+    """F-053: a space ended the wizard in an InvalidURL traceback, and a "…"
+    was reported as "couldn't reach", whose next question keeps the token."""
+    monkeypatch.setattr(
+        sw, "http_get_json", lambda *a, **k: pytest.fail("sent a token no service accepts"),
+    )
+    ok, reason = check(token)
+    assert ok is False
+    assert "character" in reason
+
+
 # ---------------------------------------------------------------------------
 # The whole flow
 # ---------------------------------------------------------------------------
@@ -228,6 +294,17 @@ def test_fresh_setup_for_both_platforms(monkeypatch):
     assert conf["DISCORD_ALLOWED_GUILD_IDS"] == "1"
     assert conf["DISCORD_ALLOWED_USER_IDS"] == ""
     assert calls["venv"] == ["telegram", "discord"]
+
+
+def test_output_without_utf8_does_not_end_the_wizard(monkeypatch):
+    """F-062: on Windows, output that isn't a console window (Git Bash, a pipe)
+    uses the ANSI code page, which has no "→" or "✓", and printing the first
+    one ended the wizard before anything was saved."""
+    monkeypatch.setattr(sw.sys, "stdout", io.TextIOWrapper(io.BytesIO(), encoding="cp1252"))
+    skip_install_steps(monkeypatch)
+    script(monkeypatch, ["3", TG_TOKEN, "", DC_TOKEN, "", "", "", "y"])
+    assert sw.main() == 0
+    assert read_conf_file(sw.CONF_FILE)["BOT_PLATFORMS"] == "telegram,discord"
 
 
 def test_rerun_keeps_existing_values_on_enter(monkeypatch):
@@ -288,6 +365,41 @@ def test_unreachable_service_can_keep_the_token(monkeypatch):
     assert read_conf_file(sw.CONF_FILE)["TELEGRAM_BOT_TOKEN"] == TG_TOKEN
 
 
+def test_a_token_txt_saved_with_a_bom_is_offered_without_it(monkeypatch):
+    """F-044: Notepad's byte-order mark stayed glued to the token."""
+    with open(sw.TOKEN_FILE, "wb") as f:
+        f.write(b"\xef\xbb\xbf" + TG_TOKEN.encode())
+    skip_install_steps(monkeypatch)
+    script(monkeypatch, ["1", "", "", "y"])  # platform, keep token, ids, save
+    assert sw.main() == 0
+    assert read_conf_file(sw.CONF_FILE)["TELEGRAM_BOT_TOKEN"] == TG_TOKEN
+
+
+def test_an_unreadable_token_txt_is_explained_not_a_crash(monkeypatch, capsys):
+    """F-044: a token.txt that isn't UTF-8 raised UnicodeDecodeError here."""
+    with open(sw.TOKEN_FILE, "wb") as f:
+        f.write(b"\x80\x81 not text")
+    skip_install_steps(monkeypatch)
+    script(monkeypatch, ["1", TG_TOKEN, "", "y"])  # no token to keep: one is asked for
+    assert sw.main() == 0
+    assert "isn't UTF-8 text" in capsys.readouterr().out
+    assert read_conf_file(sw.CONF_FILE)["TELEGRAM_BOT_TOKEN"] == TG_TOKEN
+
+
+def test_an_unreadable_conf_env_is_explained_not_a_crash(monkeypatch, capsys):
+    """F-047: a conf.env saved as "ANSI" raised UnicodeDecodeError here."""
+    old = "# Reminder bot — settings\nBOT_PLATFORMS=discord\n".encode("cp1252")
+    with open(sw.CONF_FILE, "wb") as f:
+        f.write(old)
+    skip_install_steps(monkeypatch)
+    script(monkeypatch, ["1", TG_TOKEN, "", "y"])  # nothing to keep: asked afresh
+    assert sw.main() == 0
+    assert "isn't UTF-8 text" in capsys.readouterr().out
+    assert read_conf_file(sw.CONF_FILE)["BOT_PLATFORMS"] == "telegram"
+    with open(sw.BACKUP_FILE, "rb") as f:
+        assert f.read() == old, "the unreadable file is kept as conf.env.bak"
+
+
 def test_declining_to_save_writes_nothing(monkeypatch):
     calls = skip_install_steps(monkeypatch)
     script(monkeypatch, ["1", TG_TOKEN, "", "n"])
@@ -337,6 +449,21 @@ def test_declining_the_venv_runs_nothing(monkeypatch):
     assert sw.setup_venv(["telegram"]) is None
 
 
+def test_declining_the_venv_points_back_to_it(monkeypatch, capsys):
+    """F-058: the advice was a system-wide pip install, which Debian 12 and
+    Ubuntu 23.04+ refuse ("externally-managed-environment"). The manual
+    commands now create ./venv and install into it."""
+    monkeypatch.setattr(sw.subprocess, "run", lambda *a, **k: pytest.fail("ran a command"))
+    script(monkeypatch, ["n"])
+    sw.setup_venv(["telegram"])
+    out = capsys.readouterr().out
+    shown = sw.shell_quote(os.path.relpath(sw.venv_python(), sw.HERE))
+    assert "let it create ./venv" in out
+    assert f"{sw.shell_quote(sw.sys.executable)} -m venv " in out
+    assert f"{shown} -m pip install -r requirements-telegram.txt" in out
+    assert "python3 -m pip" not in out
+
+
 def test_failed_venv_creation_cleans_up(monkeypatch):
     def fake_run(command, *args, **kwargs):
         os.makedirs(sw.VENV_DIR, exist_ok=True)  # half-made folder
@@ -346,6 +473,80 @@ def test_failed_venv_creation_cleans_up(monkeypatch):
     script(monkeypatch, ["y"])
     assert sw.setup_venv(["telegram"]) is None
     assert not os.path.exists(sw.VENV_DIR)
+
+
+def service_message(monkeypatch, capsys):
+    """What offer_service() says on a systemd Linux when the libraries are missing."""
+    monkeypatch.setattr(sw.sys, "platform", "linux")
+    monkeypatch.setattr(sw.shutil, "which", lambda name: "/usr/bin/" + name)
+    script(monkeypatch, ["n"])  # don't install the service
+    sw.offer_service(None, ["telegram"])
+    return capsys.readouterr().out
+
+
+def test_service_hint_names_the_venv_when_its_libraries_failed(monkeypatch, capsys):
+    """F-045: a failed pip install into ./venv was reported as "the service would
+    use the system Python", but install-service.sh runs ./venv whenever it exists."""
+    python = sw.venv_python(sw.VENV_DIR)
+    os.makedirs(os.path.dirname(python))
+    open(python, "w").close()
+    out = service_message(monkeypatch, capsys)
+    assert "system Python" not in out
+    assert "-m pip install -r requirements-telegram.txt" in out
+
+
+def test_service_hint_without_a_venv_still_names_the_system_python(monkeypatch, capsys):
+    assert "system Python" in service_message(monkeypatch, capsys)
+
+
+def test_run_hint_names_a_venv_whose_install_failed(monkeypatch, capsys, tmp_path):
+    """F-061: after a failed pip install the wizard said to install into ./venv,
+    then to start the bot with python3, which doesn't have the libraries."""
+    monkeypatch.setattr(sw, "HERE", str(tmp_path))
+    python = sw.venv_python(sw.VENV_DIR)
+    os.makedirs(os.path.dirname(python))
+    open(python, "w").close()
+    out = service_message(monkeypatch, capsys)
+    assert f"{sw.shell_quote(os.path.relpath(python, sw.HERE))} reminder_bot.py" in out
+    assert "python3 reminder_bot.py" not in out
+
+
+def make_existing_venv():
+    python = sw.venv_python(sw.VENV_DIR)
+    os.makedirs(os.path.dirname(python))
+    open(python, "w").close()
+    return python
+
+
+def test_recreating_the_venv_replaces_it(monkeypatch):
+    old_file = os.path.join(sw.VENV_DIR, "old.txt")
+    make_existing_venv()
+    open(old_file, "w").close()
+
+    def fake_run(command, *args, **kwargs):
+        if command[1:3] == ["-m", "venv"]:
+            make_existing_venv()
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(sw.subprocess, "run", fake_run)
+    script(monkeypatch, ["2"])  # Delete it and create a fresh one
+    assert sw.setup_venv(["telegram"]) == sw.venv_python(sw.VENV_DIR)
+    assert not os.path.exists(old_file)
+
+
+def test_a_venv_that_cant_be_deleted_is_explained_not_a_crash(monkeypatch, capsys):
+    """F-056: on Windows a running bot keeps files in ./venv open, and the
+    rmtree error ended the wizard in a traceback."""
+    make_existing_venv()
+
+    def in_use(path, *args, **kwargs):
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(sw.shutil, "rmtree", in_use)
+    monkeypatch.setattr(sw.subprocess, "run", lambda *a, **k: pytest.fail("ran a command"))
+    script(monkeypatch, ["2"])
+    assert sw.setup_venv(["telegram"]) is None
+    assert "stop the bot" in capsys.readouterr().out
 
 
 def test_failed_venv_creation_leaves_an_existing_folder_alone(monkeypatch):

@@ -1,6 +1,7 @@
 """Tests for reading conf.env and the settings in it."""
 
 import os
+import shlex
 import sys
 
 import pytest
@@ -99,6 +100,146 @@ def test_fallback_loader_survives_an_empty_key(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "environ", environ)  # keep the real one untouched
     config.load_conf_file(str(path))
     assert environ == {"BOT_PLATFORMS": "telegram"}
+
+
+TOKEN = "123456789:" + "B" * 35
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        TOKEN.encode() + b"\n",
+        b"\xef\xbb\xbf" + TOKEN.encode() + b"\r\n",  # Notepad's UTF-8
+        (TOKEN + "\r\n").encode("utf-16"),          # PowerShell 5's Out-File
+    ],
+)
+def test_read_token_file_drops_the_byte_order_mark(tmp_path, raw):
+    """F-044: the mark stayed glued to the token, or UTF-16 crashed startup."""
+    path = tmp_path / "token.txt"
+    path.write_bytes(raw)
+    assert config.read_token_file(str(path)) == TOKEN
+
+
+def test_read_token_file_explains_text_it_cannot_decode(tmp_path):
+    path = tmp_path / "token.txt"
+    path.write_bytes(b"\x80\x81 not text")
+    with pytest.raises(config.TokenFileError):
+        config.read_token_file(str(path))
+
+
+@pytest.mark.parametrize("text", [TOKEN + "\n# my bot\n", TOKEN + " my bot\n"])
+def test_read_token_file_refuses_more_than_the_token(tmp_path, text):
+    """F-064: a second line became part of the token, and the bot stopped with
+    a "Network hiccup" instead of saying what was wrong with the file."""
+    path = tmp_path / "token.txt"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(config.TokenFileError, match="more than the Telegram token"):
+        config.read_token_file(str(path))
+
+
+def test_a_token_txt_with_a_second_line_stops_the_bot_with_a_reason(tmp_path, monkeypatch):
+    pytest.importorskip("telegram")
+    import reminder_bot
+
+    path = tmp_path / "token.txt"
+    path.write_text(TOKEN + "\n# my bot\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TOKEN_FILE", str(path))
+    frontends, problems = reminder_bot.build_frontends(["telegram"])
+    assert frontends == []
+    assert len(problems) == 1 and "more than the Telegram token" in problems[0]
+
+
+def test_read_token_file_missing_is_empty(tmp_path):
+    assert config.read_token_file(str(tmp_path / "token.txt")) == ""
+
+
+def test_an_unreadable_token_txt_stops_the_bot_with_a_reason(tmp_path, monkeypatch):
+    """F-044: startup ended in a UnicodeDecodeError traceback."""
+    pytest.importorskip("telegram")
+    import reminder_bot
+
+    path = tmp_path / "token.txt"
+    path.write_bytes(b"\x80\x81 not text")
+    monkeypatch.setattr(config, "TOKEN_FILE", str(path))
+    frontends, problems = reminder_bot.build_frontends(["telegram"])
+    assert frontends == []
+    assert len(problems) == 1 and "isn't UTF-8 text" in problems[0]
+
+
+def test_the_missing_library_hint_quotes_a_path_with_spaces(monkeypatch):
+    """F-054: pasted, the unquoted hint split "My Bots" and ran ".../My"."""
+    import reminder_bot
+    import reminderbot
+
+    python = "/home/pi/My Bots/bot/venv/bin/python"
+    monkeypatch.setattr(reminder_bot.sys, "executable", python)
+    # As if the library were missing: `from reminderbot import telegram_bot`
+    # then raises ImportError.
+    monkeypatch.setitem(sys.modules, "reminderbot.telegram_bot", None)
+    monkeypatch.delattr(reminderbot, "telegram_bot", raising=False)
+    frontends, problems = reminder_bot.build_frontends(["telegram"])
+    assert frontends == []
+    hint = next(line.strip() for line in problems[0].splitlines() if "-m pip install" in line)
+    if os.name == "nt":
+        # PowerShell 5.1 can't run a quoted path without its call operator.
+        assert hint.startswith(f'& "{python}" -m pip')
+    else:
+        assert shlex.split(hint)[0] == python
+
+
+def test_the_missing_library_hint_names_the_projects_venv_relatively(monkeypatch, tmp_path):
+    """F-054: relative to the project folder, where the hint is pasted, the
+    venv's Python needs no quotes, so it works in bash, cmd and PowerShell."""
+    import reminder_bot
+    import reminderbot
+
+    here = tmp_path / "My Bots"
+    scripts = ("Scripts", "python.exe") if os.name == "nt" else ("bin", "python")
+    monkeypatch.setattr(config, "HERE", str(here))
+    monkeypatch.setattr(reminder_bot.sys, "executable", os.path.join(str(here), "venv", *scripts))
+    monkeypatch.setitem(sys.modules, "reminderbot.discord_bot", None)
+    monkeypatch.delattr(reminderbot, "discord_bot", raising=False)
+    frontends, problems = reminder_bot.build_frontends(["discord"])
+    hint = next(line.strip() for line in problems[0].splitlines() if "-m pip install" in line)
+    assert hint == f"{os.path.join('venv', *scripts)} -m pip install -r requirements-discord.txt"
+
+
+# conf.env.example's "—" as an editor saving "ANSI" (Windows-1252) writes it.
+ANSI_CONF = "# Reminder bot — settings\nBOT_PLATFORMS=telegram\n".encode("cp1252")
+
+
+def test_read_conf_file_explains_text_it_cannot_decode(tmp_path):
+    """F-047: an ANSI-saved conf.env raised a raw UnicodeDecodeError."""
+    path = tmp_path / "conf.env"
+    path.write_bytes(ANSI_CONF)
+    with pytest.raises(config.ConfFileError):
+        config.read_conf_file(str(path))
+
+
+@pytest.mark.parametrize("with_dotenv", [True, False])
+def test_load_conf_file_explains_text_it_cannot_decode(tmp_path, monkeypatch, with_dotenv):
+    """The bot reads conf.env with dotenv when it's installed, else the parser above."""
+    if with_dotenv:
+        pytest.importorskip("dotenv")
+    else:
+        monkeypatch.setitem(sys.modules, "dotenv", None)  # import dotenv -> ImportError
+    monkeypatch.setattr(os, "environ", {})  # keep the real one untouched
+    path = tmp_path / "conf.env"
+    path.write_bytes(ANSI_CONF)
+    with pytest.raises(config.ConfFileError):
+        config.load_conf_file(str(path))
+
+
+def test_an_unreadable_conf_env_stops_the_bot_with_a_reason(tmp_path, monkeypatch, capsys):
+    """F-047: startup ended in a UnicodeDecodeError traceback."""
+    import reminder_bot
+
+    path = tmp_path / "conf.env"
+    path.write_bytes(ANSI_CONF)
+    real_load = config.load_conf_file
+    monkeypatch.setattr(config, "load_conf_file", lambda: real_load(str(path)))
+    assert reminder_bot.main() == 1
+    assert "isn't UTF-8 text" in capsys.readouterr().out
 
 
 def test_enabled_platforms_from_bot_platforms(monkeypatch):

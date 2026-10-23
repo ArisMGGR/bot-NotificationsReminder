@@ -19,7 +19,9 @@ needed to handle them, so they keep working after the bot restarts.
 """
 
 import asyncio
+import logging
 import os
+import socket
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -122,7 +124,7 @@ def clip(text, limit=MAX_OPTION_LEN):
 
 
 def alert_text(reminder):
-    return f"🔔 **{esc(reminder['title'])}**\n\nYou have to check it!"
+    return f"🔔 **{esc(reminder['title'])}**\nYou have to check it!"
 
 
 def alert_view(reminder_id):
@@ -211,7 +213,9 @@ async def handle_new_submit(interaction, title, interval_text):
     parsed = core.parse_interval(interval_text or "")
     if parsed is None:
         await interaction.response.send_message(
-            f"I didn't get “{clip(interval_text or '', 40)}” as an interval. Run `/new` "
+            # Escaped like every other interpolation: a backtick or "**" in the
+            # answer would otherwise pair with the markup below and garble it.
+            f"I didn't get “{esc(clip(interval_text or '', 40))}” as an interval. Run `/new` "
             "again and try something like `5 days` or `30 minutes` "
             f"(at most {core.MAX_INTERVAL_WEEKS} weeks).",
             ephemeral=True,
@@ -271,6 +275,19 @@ async def handle_close(interaction):
         )
 
 
+async def run_item_handler(interaction, handler, *args):
+    """Run a button/dropdown handler, reporting a failure as commands do.
+
+    discord.py only logs an exception from a dynamic item's callback, as a raw
+    traceback, and the user is left with "This interaction failed". Slash
+    commands and the /new form go through report_interaction_error() instead.
+    """
+    try:
+        await handler(interaction, *args)
+    except Exception as error:
+        await report_interaction_error(interaction, error)
+
+
 async def handle_ok(interaction, reminder_id):
     """OK on a due-reminder alert: restart the timer and say so in place."""
     reminder = await core.act_on_reminder(
@@ -315,7 +332,7 @@ class OkButton(discord.ui.DynamicItem[discord.ui.Button], template=r"remind:ok:(
         return await guard(interaction)
 
     async def callback(self, interaction):
-        await handle_ok(interaction, self.reminder_id)
+        await run_item_handler(interaction, handle_ok, self.reminder_id)
 
 
 class ListSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"remind:list:(?P<action>reset|del)"):
@@ -353,7 +370,7 @@ class ListSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"remind:li
             reminder_id = int(self.item.values[0])
         except (IndexError, ValueError):
             return
-        await handle_list_action(interaction, self.action, reminder_id)
+        await run_item_handler(interaction, handle_list_action, self.action, reminder_id)
 
 
 class CloseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"remind:list:close"):
@@ -375,7 +392,7 @@ class CloseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"remind:l
         return await guard(interaction)
 
     async def callback(self, interaction):
-        await handle_close(interaction)
+        await run_item_handler(interaction, handle_close)
 
 
 class NewReminderModal(discord.ui.Modal, title="New reminder"):
@@ -461,6 +478,20 @@ def describe_error(error: Exception) -> str:
             "permission to post in that channel, or the user's DMs are closed."
         )
     if isinstance(error, discord.NotFound):
+        # Discord's error code says *what* wasn't found. Read as a deleted
+        # channel, an interaction that simply expired would send the operator
+        # looking for a channel problem that isn't there.
+        if error.code == 10062:  # Unknown interaction
+            return (
+                "⏳ Discord says that interaction expired (NotFound): the bot "
+                "didn't answer within Discord's 3-second limit, usually because "
+                "the machine was busy. The user can just try again."
+            )
+        if error.code == 10008:  # Unknown message
+            return (
+                "🚫 Discord says that message doesn't exist any more (NotFound) — "
+                "it was probably deleted."
+            )
         return (
             "🚫 Discord says that channel doesn't exist any more (NotFound), "
             "or the bot can no longer see it."
@@ -472,6 +503,14 @@ def describe_error(error: Exception) -> str:
         )
     if isinstance(error, discord.HTTPException):
         return f"⚠️  Discord rejected a request we sent ({error.status}: {error.text})."
+    if isinstance(error, aiohttp.ClientConnectorError) and isinstance(
+        error.os_error, socket.gaierror
+    ):
+        return (
+            f"🌐 Can't reach Discord: the DNS lookup for {error.host} failed, so "
+            "this machine is offline or its network/DNS isn't working right now - "
+            "the bot reconnects automatically once it's back"
+        )
     if isinstance(error, (aiohttp.ClientError, asyncio.TimeoutError)):
         detail = str(error).strip() or error.__class__.__name__
         return (
@@ -482,6 +521,31 @@ def describe_error(error: Exception) -> str:
 
 
 core.ERROR_DESCRIBERS.append(describe_error)
+
+
+class ReconnectLogFilter(logging.Filter):
+    """Turn discord.py's per-retry traceback dump into one readable warning."""
+
+    PREFIX = "Attempting a reconnect in "
+
+    def filter(self, record):
+        error = record.exc_info[1] if record.exc_info else None
+        message = record.getMessage()
+        if error is None or not message.startswith(self.PREFIX):
+            return True
+        reason = describe_error(error) or (
+            f"🌐 Lost the connection to Discord ({error.__class__.__name__}: {error})"
+        )
+        delay = message.removeprefix(self.PREFIX)
+        record.msg = f"{reason.rstrip('.')} (next attempt in {delay})."
+        record.args = None
+        record.exc_info = None
+        record.exc_text = None
+        record.levelno, record.levelname = logging.WARNING, "WARNING"
+        return True
+
+
+logging.getLogger("discord.client").addFilter(ReconnectLogFilter())
 
 
 async def report_interaction_error(interaction, error):
