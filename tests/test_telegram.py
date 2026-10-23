@@ -663,7 +663,7 @@ def test_log_lines_name_the_allow_list_setting_in_use(monkeypatch):
     monkeypatch.setenv("ALLOWED_CHAT_IDS", "1")
     monkeypatch.setattr(tg, "ALLOWED_CHAT_IDS", set())
     monkeypatch.setattr(tg, "ALLOWED_CHAT_IDS_SETTING", tg.ALLOWED_CHAT_IDS_SETTING)
-    frontend = tg.TelegramFrontend("123456:" + "A" * 35)  # builds offline
+    tg.TelegramFrontend("123456:" + "A" * 35)  # builds offline
     messages = []
 
     class Capture(logging.Handler):
