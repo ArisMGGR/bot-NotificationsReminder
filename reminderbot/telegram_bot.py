@@ -150,8 +150,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Interval examples: `5 days`, `30 minutes`, `2 hours`, `1 week`, "
         "`45 seconds`\\.\n\n"
         "Other commands:\n"
-        "• /list – all reminders in one message, with Reset / Delete buttons "
-        "per reminder and a Close list button\n"
+        "• /list – your reminders in one message \\(a very long list is trimmed\\), "
+        "with Reset / Delete buttons per reminder and a Close list button\n"
         "• /cancel – stop creating a reminder",
         parse_mode=ParseMode.MARKDOWN_V2,
     )
